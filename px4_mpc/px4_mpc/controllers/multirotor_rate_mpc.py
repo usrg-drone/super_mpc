@@ -39,8 +39,8 @@ import casadi as cs
 class MultirotorRateMPC():
     def __init__(self, model):
         self.model = model
-        self.Tf = 5.0
-        self.N = 49
+        self.Tf = 25.0
+        self.N = 100
 
         self.x0 = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
 
@@ -66,9 +66,16 @@ class MultirotorRateMPC():
         ocp.dims.N = N_horizon
 
         # set cost
-        Q_mat = 2*np.diag([1e1, 1e1, 1e1, 1e1, 1e1, 1e1, 0.0, 0.0, 0.0, 0.0])
-        Q_e = 2*np.diag([3e2, 3e2, 3e2, 1e2, 1e2, 1e2, 0.0, 0.0, 0.0, 0.0])
-        R_mat = 2*np.diag([1e1, 5e2, 5e2, 5e2])
+        # Q_mat = 2*np.diag([1e1, 1e1, 1e1, 1e1, 1e1, 1e1, 0.0, 0.0, 0.0, 0.0])
+        # Q_e = 2*np.diag([3e2, 3e2, 3e2, 1e2, 1e2, 1e2, 0.0, 0.0, 0.0, 0.0])
+
+        Q_mat = 2*np.diag([5e2, 5e2, 10e2, 2e2, 2e2, 2e2, 0.0, 0.0, 0.0, 0.0])
+        Q_e = 2*np.diag([8e2, 8e2, 20e2, 3e2, 3e2, 3e2, 0.0, 0.0, 0.0, 0.0])
+
+        # R_mat = 2*np.diag([1e1, 5e2, 5e2, 5e2])
+        R_mat = 2*np.diag([5e0, 5e0, 5e0, 5e0])  # Reduce thrust penalty, but keep body rate penalty
+
+
 
         # TODO: How do you add terminal costs?
 

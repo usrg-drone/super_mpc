@@ -42,7 +42,7 @@ class MultirotorRateModel():
         self.mass = 1.
         hover_thrust = 0.73
         self.max_thrust = self.mass * 9.81/hover_thrust
-        self.max_rate = 0.5
+        self.max_rate = 1.0
 
     def get_acados_model(self) -> AcadosModel:
         def skew_symmetric(v):
