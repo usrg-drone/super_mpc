@@ -152,7 +152,7 @@ class QuadrotorMPC(Node):
             f"{self.setpoint_position[2]}]"
         )
 
-    def ref_traj_callback(self, msg: PolynomialTrajectory):
+    def ref_traj_callback(self, msg: PolynomialTrajectory): # @TODO: Read from here
         position_traj = Path()
         position_traj.header = msg.header
         # position_traj.header.frame_id = 'map'
@@ -238,7 +238,11 @@ class QuadrotorMPC(Node):
             i += 1
         if i < self.mpc.ocp_solver.N and len(self.yref_array) > 0:
             for j in range(i, self.mpc.ocp_solver.N):
-                self.mpc.ocp_solver.set(j, "yref", self.yref_array[-1])
+                yref = self.yref_array[-1]
+                yref[3] = 0.0
+                yref[4] = 0.0
+                yref[5] = 0.0
+                self.mpc.ocp_solver.set(j, "yref", yref)
             self.mpc.ocp_solver.set(self.mpc.ocp_solver.N, "yref", self.yref_array[-1][:10])
             
 
