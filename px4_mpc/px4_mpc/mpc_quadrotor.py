@@ -6,12 +6,15 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from mavros_msgs.msg import State, AttitudeTarget
 from mavros_msgs.srv import SetMode, CommandBool
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PoseStamped, Pose
 
 from mars_quadrotor_msgs.msg import PositionCommand  # Correct message type
 
 from px4_mpc.models.multirotor_rate_model import MultirotorRateModel
 from px4_mpc.controllers.multirotor_rate_mpc import MultirotorRateMPC
+
+from mars_quadrotor_msgs.msg import PolynomialTrajectory
 
 class QuadrotorMPC(Node):
 
@@ -37,11 +40,23 @@ class QuadrotorMPC(Node):
             self.odom_callback,
             qos_profile
         )
-        
+        self.vel_sub = self.create_subscription(
+            Odometry,
+            '/mavros/local_position/velocity_local',
+            self.vel_callback,
+            qos_profile
+        )
         self.goal_sub = self.create_subscription(
             PositionCommand,  # Updated message type
             '/planning/pos_cmd',
             self.nav_goal_callback,
+            qos_profile
+        )
+
+        self.ref_traj_sub = self.create_subscription(
+            PolynomialTrajectory,  # Updated message type
+            '/planning_cmd/poly_traj',
+            self.ref_traj_callback,
             qos_profile
         )
 
@@ -51,6 +66,16 @@ class QuadrotorMPC(Node):
             '/mavros/setpoint_raw/attitude',
             qos_profile
         )
+        self.ref_traj_pub = self.create_publisher(
+            Path,
+            '/planning_cmd/poly_traj_debug',
+            qos_profile
+        )
+        self.solution_traj_pub = self.create_publisher(
+            Path,
+            '/mpc/solution_traj',
+            qos_profile
+        )
 
         # Clients
         self.set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
@@ -58,13 +83,14 @@ class QuadrotorMPC(Node):
 
         timer_period = 0.01  # 10 ms
         self.timer = self.create_timer(timer_period, self.cmdloop_callback)
-
+        self.dt = 0.1
+        self.time = 0.0
         # State variables
         self.current_state = State()
         self.vehicle_position = np.array([0.0, 0.0, 0.0])
         self.vehicle_velocity = np.array([0.0, 0.0, 0.0])
         self.vehicle_attitude = np.array([1.0, 0.0, 0.0, 0.0])
-
+        self.ref_traj = None
         # Default setpoint (will be updated by the 2D nav goal)
         self.setpoint_position = np.array([0.0, 0.0, 5.0])
 
@@ -76,6 +102,7 @@ class QuadrotorMPC(Node):
         self.current_state = msg
 
     def odom_callback(self, msg):
+        self.time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         self.vehicle_position = np.array([
             msg.pose.pose.position.x,
             msg.pose.pose.position.y,
@@ -87,10 +114,12 @@ class QuadrotorMPC(Node):
             msg.pose.pose.orientation.y,
             msg.pose.pose.orientation.z
         ])
+ 
+    def vel_callback(self, msg):
         self.vehicle_velocity = np.array([
-            msg.twist.twist.linear.x,
-            msg.twist.twist.linear.y,
-            msg.twist.twist.linear.z
+            msg.twist.linear.x,
+            msg.twist.linear.y,
+            msg.twist.linear.z
         ])
 
     def nav_goal_callback(self, msg: PositionCommand):
@@ -98,9 +127,13 @@ class QuadrotorMPC(Node):
         self.setpoint_position = np.array([
             msg.position.x,
             msg.position.y,
-            5.0  # Fixed altitude
+            msg.position.z,
         ])
-
+        self.setpoint_velocity = np.array([
+            msg.velocity.x,
+            msg.velocity.y,
+            msg.velocity.z,
+        ])
         self.get_logger().info(
             f"Received PositionCommand -> New setpoint: ["
             f"{self.setpoint_position[0]}, "
@@ -108,19 +141,80 @@ class QuadrotorMPC(Node):
             f"{self.setpoint_position[2]}]"
         )
 
+    def ref_traj_callback(self, msg: PolynomialTrajectory):
+        position_traj = Path()
+        position_traj.header = msg.header
+        # position_traj.header.frame_id = 'map'
+        stamp = self.time
+        for i in range(msg.piece_num_pos):
+            t = np.arange(0, msg.time_pos[i], self.dt)
+            x = np.polyval(msg.coef_pos_x[8*i:8*(i+1)],t)
+            y = np.polyval(msg.coef_pos_y[8*i:8*(i+1)],t)
+            z = np.polyval(msg.coef_pos_z[8*i:8*(i+1)],t)
+            for j in range(len(t)):
+                pose = PoseStamped()
+                pose.header = msg.header
+                pose.header.stamp.sec = int(stamp)
+                pose.header.stamp.nanosec = int((stamp - int(stamp)) * 1e9)
+                pose.pose.position.x = x[j]
+                pose.pose.position.y = y[j]
+                pose.pose.position.z = z[j]
+                position_traj.poses.append(pose)
+                stamp += self.dt
+        idx = 0
+        for i in range(msg.piece_num_yaw):
+            t = np.arange(0, msg.time_yaw[i], self.dt)
+            yaw = np.polyval(msg.coef_yaw[8*i:8*(i+1)],t)
+            for j in range(len(t)):
+                if idx < len(position_traj.poses):
+                    position_traj.poses[idx].pose.orientation.w = np.cos(yaw[j]/2 * np.pi / 180.0)
+                    position_traj.poses[idx].pose.orientation.z = np.sin(yaw[j]/2 * np.pi / 180.0)
+                    idx += 1
+        if len(position_traj.poses) > 0:
+            self.ref_traj_pub.publish(position_traj)
+            self.ref_traj = position_traj
+
+
     def cmdloop_callback(self):
         error_position = self.vehicle_position - self.setpoint_position
         self.get_logger().info(f"Position Error: {error_position}")
 
+        # error_velocity = self.vehicle_velocity - self.setpoint_velocity
         # Current state vector
         x0 = np.array([
-            error_position[0], error_position[1], error_position[2],
+            self.vehicle_position[0], self.vehicle_position[1], self.vehicle_position[2],
             self.vehicle_velocity[0], self.vehicle_velocity[1], self.vehicle_velocity[2],
             self.vehicle_attitude[0], self.vehicle_attitude[1], self.vehicle_attitude[2], self.vehicle_attitude[3]
         ]).reshape(10, 1)
 
+        i = 0
+        yref = None
+        if self.ref_traj is None:
+            return
+        for i in range(len(self.ref_traj.poses)):
+            if i >= self.mpc.ocp_solver.N:
+                break
+            ref = self.ref_traj.poses[i]
+            ref_last = self.ref_traj.poses[i-1] if i==0 else ref
+            vx = (ref.pose.position.x - ref_last.pose.position.x) / self.dt
+            vy = (ref.pose.position.y - ref_last.pose.position.y) / self.dt
+            vz = (ref.pose.position.z - ref_last.pose.position.z) / self.dt
+            yref = np.array([
+                ref.pose.position.x, ref.pose.position.y, ref.pose.position.z,
+                vx, vy, vz,
+                ref.pose.orientation.w, ref.pose.orientation.x, ref.pose.orientation.y, ref.pose.orientation.z,
+                0.0, 0.0, 0.0, 0.0
+            ]).reshape(14, 1)
+            self.mpc.ocp_solver.set(i, "yref", yref)
+            i += 1
+        if i < self.mpc.ocp_solver.N and yref is not None:
+            for j in range(i, self.mpc.ocp_solver.N):
+                self.mpc.ocp_solver.set(j, "yref", yref)
+            self.mpc.ocp_solver.set(self.mpc.ocp_solver.N, "yref", yref[:10])
+            
+
         # Solve MPC
-        u_pred, _ = self.mpc.solve(x0)
+        u_pred, x_pred = self.mpc.solve(x0)
         thrust_rates = u_pred[0, :]
 
         # Example scaling for thrust
@@ -137,9 +231,25 @@ class QuadrotorMPC(Node):
         attitude_target.body_rate.y = thrust_rates[2]
         attitude_target.body_rate.z = -thrust_rates[3]
         attitude_target.thrust = thrust_command
-        attitude_target.type_mask = 8
+        attitude_target.type_mask = attitude_target.IGNORE_ATTITUDE
 
         self.attitude_pub.publish(attitude_target)
+
+        solution_path = Path()
+        solution_path.header.stamp = self.get_clock().now().to_msg()
+        solution_path.header.frame_id = 'world'
+        for i in range(len(x_pred)):
+            pose = PoseStamped()
+            pose.header.stamp = self.get_clock().now().to_msg()
+            pose.pose.position.x = x_pred[i][0]
+            pose.pose.position.y = x_pred[i][1]
+            pose.pose.position.z = x_pred[i][2]
+            pose.pose.orientation.w = x_pred[i][6]
+            pose.pose.orientation.x = x_pred[i][7]
+            pose.pose.orientation.y = x_pred[i][8]
+            pose.pose.orientation.z = x_pred[i][9]
+            solution_path.poses.append(pose)
+        self.solution_traj_pub.publish(solution_path)
 
     def arm_and_set_mode(self):
         if not self.current_state.armed:
