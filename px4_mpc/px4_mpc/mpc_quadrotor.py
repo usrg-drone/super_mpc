@@ -8,6 +8,7 @@ from mavros_msgs.msg import State, AttitudeTarget
 from mavros_msgs.srv import SetMode, CommandBool
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped, Pose
+from std_msgs.msg import Float64MultiArray
 
 from mars_quadrotor_msgs.msg import PositionCommand  # Correct message type
 
@@ -76,6 +77,11 @@ class QuadrotorMPC(Node):
             '/mpc/solution_traj',
             qos_profile
         )
+        self.solution_control_pub = self.create_publisher(
+            Float64MultiArray,
+            '/mpc/solution_control',
+            qos_profile
+        )
 
         # Clients
         self.set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
@@ -83,6 +89,8 @@ class QuadrotorMPC(Node):
 
         timer_period = 0.01  # 10 ms
         self.timer = self.create_timer(timer_period, self.cmdloop_callback)
+        timer_period2 = 0.1  # 100 ms
+        self.timer2 = self.create_timer(timer_period2, self.debug_callback)
         self.dt = 0.1
         self.time = 0.0
         # State variables
@@ -91,6 +99,9 @@ class QuadrotorMPC(Node):
         self.vehicle_velocity = np.array([0.0, 0.0, 0.0])
         self.vehicle_attitude = np.array([1.0, 0.0, 0.0, 0.0])
         self.ref_traj = None
+        self.yref_array = []
+        self.x_pred = None
+        self.u_pred = None
         # Default setpoint (will be updated by the 2D nav goal)
         self.setpoint_position = np.array([0.0, 0.0, 5.0])
 
@@ -173,6 +184,36 @@ class QuadrotorMPC(Node):
         if len(position_traj.poses) > 0:
             self.ref_traj_pub.publish(position_traj)
             self.ref_traj = position_traj
+            
+        if self.ref_traj is None:
+            return
+        if self.vehicle_position is None:
+            return
+        closest_idx = 0
+        closest_dist = 0
+        self.yref_array = []
+        for i in range(len(self.ref_traj.poses)):
+            ref = self.ref_traj.poses[i]
+            ref_pos = np.array([ref.pose.position.x, ref.pose.position.y, ref.pose.position.z])
+            dist = np.linalg.norm(self.vehicle_position - ref_pos)
+            if i == 0 or dist < closest_dist:
+                closest_dist = dist
+                closest_idx = i
+        for i in range(closest_idx, len(self.ref_traj.poses)):
+            if i >= self.mpc.ocp_solver.N:
+                break
+            ref = self.ref_traj.poses[i]
+            ref_last = self.ref_traj.poses[i-1] if i==0 else ref
+            vx = (ref.pose.position.x - ref_last.pose.position.x) / self.dt
+            vy = (ref.pose.position.y - ref_last.pose.position.y) / self.dt
+            vz = (ref.pose.position.z - ref_last.pose.position.z) / self.dt
+            yref = np.array([
+                ref.pose.position.x, ref.pose.position.y, ref.pose.position.z,
+                vx, vy, vz,
+                ref.pose.orientation.w, ref.pose.orientation.x, ref.pose.orientation.y, ref.pose.orientation.z,
+                0.0, 0.0, 0.0, 0.0
+            ]).reshape(14, 1)
+            self.yref_array.append(yref)
 
 
     def cmdloop_callback(self):
@@ -188,29 +229,17 @@ class QuadrotorMPC(Node):
         ]).reshape(10, 1)
 
         i = 0
-        yref = None
         if self.ref_traj is None:
             return
-        for i in range(len(self.ref_traj.poses)):
+        for i in range(len(self.yref_array)):
             if i >= self.mpc.ocp_solver.N:
                 break
-            ref = self.ref_traj.poses[i]
-            ref_last = self.ref_traj.poses[i-1] if i==0 else ref
-            vx = (ref.pose.position.x - ref_last.pose.position.x) / self.dt
-            vy = (ref.pose.position.y - ref_last.pose.position.y) / self.dt
-            vz = (ref.pose.position.z - ref_last.pose.position.z) / self.dt
-            yref = np.array([
-                ref.pose.position.x, ref.pose.position.y, ref.pose.position.z,
-                vx, vy, vz,
-                ref.pose.orientation.w, ref.pose.orientation.x, ref.pose.orientation.y, ref.pose.orientation.z,
-                0.0, 0.0, 0.0, 0.0
-            ]).reshape(14, 1)
-            self.mpc.ocp_solver.set(i, "yref", yref)
+            self.mpc.ocp_solver.set(i, "yref", self.yref_array[i])
             i += 1
-        if i < self.mpc.ocp_solver.N and yref is not None:
+        if i < self.mpc.ocp_solver.N and len(self.yref_array) > 0:
             for j in range(i, self.mpc.ocp_solver.N):
-                self.mpc.ocp_solver.set(j, "yref", yref)
-            self.mpc.ocp_solver.set(self.mpc.ocp_solver.N, "yref", yref[:10])
+                self.mpc.ocp_solver.set(j, "yref", self.yref_array[-1])
+            self.mpc.ocp_solver.set(self.mpc.ocp_solver.N, "yref", self.yref_array[-1][:10])
             
 
         # Solve MPC
@@ -235,21 +264,36 @@ class QuadrotorMPC(Node):
 
         self.attitude_pub.publish(attitude_target)
 
+        self.x_pred = x_pred
+        self.u_pred = u_pred
+
+    def debug_callback(self):
+        if self.x_pred is None or self.u_pred is None:
+            return
         solution_path = Path()
         solution_path.header.stamp = self.get_clock().now().to_msg()
         solution_path.header.frame_id = 'world'
-        for i in range(len(x_pred)):
+        for i in range(len(self.x_pred)):
             pose = PoseStamped()
             pose.header.stamp = self.get_clock().now().to_msg()
-            pose.pose.position.x = x_pred[i][0]
-            pose.pose.position.y = x_pred[i][1]
-            pose.pose.position.z = x_pred[i][2]
-            pose.pose.orientation.w = x_pred[i][6]
-            pose.pose.orientation.x = x_pred[i][7]
-            pose.pose.orientation.y = x_pred[i][8]
-            pose.pose.orientation.z = x_pred[i][9]
+            pose.pose.position.x = self.x_pred[i][0]
+            pose.pose.position.y = self.x_pred[i][1]
+            pose.pose.position.z = self.x_pred[i][2]
+            pose.pose.orientation.w = self.x_pred[i][6]
+            pose.pose.orientation.x = self.x_pred[i][7]
+            pose.pose.orientation.y = self.x_pred[i][8]
+            pose.pose.orientation.z = self.x_pred[i][9]
             solution_path.poses.append(pose)
         self.solution_traj_pub.publish(solution_path)
+
+        # @TODO: Publish control trajectory for debugging
+        # control = Float64MultiArray()
+        # control.layout.dim.label = "control"
+        # control.layout.dim.size = len(self.u_pred)
+        # control.layout.dim.stride = len(self.u_pred[0])
+        # for i in range(len(self.u_pred)):
+        #     control.data.append(self.u_pred[i])
+        # self.solution_control_pub.publish(control)
 
     def arm_and_set_mode(self):
         if not self.current_state.armed:
