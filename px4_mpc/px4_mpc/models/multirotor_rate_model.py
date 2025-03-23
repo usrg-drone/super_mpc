@@ -40,7 +40,7 @@ class MultirotorRateModel():
 
         # constants
         self.mass = 1.
-        hover_thrust = 0.73
+        hover_thrust = 0.5818 #0.73
         self.max_thrust = self.mass * 9.81/hover_thrust
         self.max_rate = 1.0
 

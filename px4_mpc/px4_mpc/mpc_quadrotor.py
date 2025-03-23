@@ -91,6 +91,7 @@ class QuadrotorMPC(Node):
         self.timer = self.create_timer(timer_period, self.cmdloop_callback)
         timer_period2 = 0.1  # 100 ms
         self.timer2 = self.create_timer(timer_period2, self.debug_callback)
+        self.timer_period = timer_period
         self.dt = 0.1
         self.time = 0.0
         # State variables
@@ -108,6 +109,9 @@ class QuadrotorMPC(Node):
         # Create Quadrotor Model and MPC Controller
         self.model = MultirotorRateModel()
         self.mpc = MultirotorRateMPC(self.model)
+
+        self.tuning_mode = True
+        self.last_command_time = self.get_clock().now()
 
     def state_callback(self, msg):
         self.current_state = msg
@@ -217,8 +221,31 @@ class QuadrotorMPC(Node):
 
 
     def cmdloop_callback(self):
+        command_time = self.get_clock().now()
+        if (command_time - self.last_command_time).nanoseconds * 1e-9 < self.dt and self.u_pred is not None:
+            thrust_rates = self.u_pred[0, :]
+            # np.delete(self.u_pred, 0, 0)
+
+            # Example scaling for thrust
+            thrust_command = thrust_rates[0] * 0.07
+
+
+            attitude_target = AttitudeTarget()
+            attitude_target.header.stamp = self.get_clock().now().to_msg()
+            attitude_target.orientation.w = 1.0
+            attitude_target.orientation.x = 0.0
+            attitude_target.orientation.y = 0.0
+            attitude_target.orientation.z = 0.0
+            attitude_target.body_rate.x = thrust_rates[1]
+            attitude_target.body_rate.y = thrust_rates[2]
+            attitude_target.body_rate.z = -thrust_rates[3]
+            attitude_target.thrust = thrust_command
+            attitude_target.type_mask = attitude_target.IGNORE_ATTITUDE
+
+            self.attitude_pub.publish(attitude_target)
+            return
         error_position = self.vehicle_position - self.setpoint_position
-        self.get_logger().info(f"Position Error: {error_position}")
+        # self.get_logger().info(f"Position Error: {error_position}")
 
         # error_velocity = self.vehicle_velocity - self.setpoint_velocity
         # Current state vector
@@ -229,14 +256,50 @@ class QuadrotorMPC(Node):
         ]).reshape(10, 1)
 
         i = 0
-        if self.ref_traj is None:
+        if self.tuning_mode and (command_time - self.last_command_time).nanoseconds * 1e-9 >= self.dt:
+            self.yref_array = []
+            position_traj = Path()
+            position_traj.header.stamp = self.get_clock().now().to_msg()
+            position_traj.header.frame_id = 'world'
+            w0 = np.arctan2(self.vehicle_position[1], self.vehicle_position[0])
+            for i in range(self.mpc.ocp_solver.N):
+                r = 10.0
+                v = 1.5
+                sec = command_time.nanoseconds * 1e-9
+                px = r * np.cos((v/r * i + sec) * self.dt) # + w0)
+                py = r * np.sin((v/r * i + sec) * self.dt) # + w0)
+                pz = 10.0
+                vx = -v * np.sin((v/r * i + sec) * self.dt) # + w0)
+                vy = v * np.cos((v/r * i + sec) * self.dt) # + w0)
+                vz = 0.0
+
+                pose = PoseStamped()
+                pose.header.stamp = self.get_clock().now().to_msg()
+                pose.pose.position.x = px
+                pose.pose.position.y = py
+                pose.pose.position.z = pz
+                position_traj.poses.append(pose)
+
+                yref = np.array([
+                    px, py, pz,
+                    vx, vy, vz,
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0
+                ]).reshape(14, 1)
+                self.yref_array.append(yref)
+                i += 1
+            self.ref_traj_pub.publish(position_traj)
+        self.last_command_time = command_time
+
+        i = 0
+        if self.yref_array is None:
             return
         for i in range(len(self.yref_array)):
-            if i >= self.mpc.ocp_solver.N:
+            if i > self.mpc.ocp_solver.N:
                 break
             self.mpc.ocp_solver.set(i, "yref", self.yref_array[i])
             i += 1
-        if i < self.mpc.ocp_solver.N and len(self.yref_array) > 0:
+        if i <= self.mpc.ocp_solver.N and len(self.yref_array) > 0:
             for j in range(i, self.mpc.ocp_solver.N):
                 yref = self.yref_array[-1]
                 yref[3] = 0.0
@@ -247,7 +310,7 @@ class QuadrotorMPC(Node):
             
 
         # Solve MPC
-        u_pred, x_pred = self.mpc.solve(x0)
+        u_pred, x_pred = self.mpc.solve(x0, verbose=True)
         thrust_rates = u_pred[0, :]
 
         # Example scaling for thrust
